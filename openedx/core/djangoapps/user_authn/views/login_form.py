@@ -6,6 +6,7 @@ import logging
 import urlparse
 from django.conf import settings
 from django.contrib import messages
+from django.http import HttpResponseRedirect, Http404
 from django.shortcuts import redirect
 from django.utils.translation import ugettext as _
 from django.views.decorators.csrf import ensure_csrf_cookie
@@ -32,6 +33,7 @@ from openedx.features.enterprise_support.utils import (
     handle_enterprise_cookies_for_logistration,
     update_logistration_context_for_enterprise,
 )
+from six.moves.urllib.parse import urlencode
 from student.helpers import get_next_url_for_login_page
 import third_party_auth
 from third_party_auth import pipeline
@@ -56,6 +58,9 @@ def login_and_registration_form(request, initial_mode="login"):
     """
     # Determine the URL to redirect to following login/registration/third_party_auth
     redirect_to = get_next_url_for_login_page(request)
+
+    if settings.FEATURES.get('ENABLE_AZURE_AD_LOGIN_REDIRECTION', False):
+        return _azure_ad_login_redirection(request)
 
     # If we're already logged in, redirect to the dashboard
     # Note: We check for the existence of login-related cookies in addition to is_authenticated
@@ -161,6 +166,55 @@ def login_and_registration_form(request, initial_mode="login"):
     handle_enterprise_cookies_for_logistration(request, response, context)
 
     return response
+
+
+def _azure_ad_login_redirection(request):
+    backend_name = 'azuread-oauth2'
+
+    if third_party_auth.is_enabled() and backend_name:
+        provider = [enabled for enabled in third_party_auth.provider.Registry.enabled()
+                    if enabled.backend_name == backend_name]
+        fallback_url = configuration_helpers.get_value('LMS_BASE')
+        if not provider and fallback_url:
+            next_url = urlencode({'next': _get_current_url(request)})
+            redirect_url = '//{}?{}'.format(fallback_url, next_url)
+            log.info('No Auth Provider found, redirecting to "{}"'.format(redirect_url))
+            return HttpResponseRedirect(redirect_url)
+        elif provider:
+            login_url = pipeline.get_login_url(
+                provider[0].provider_id,
+                pipeline.AUTH_ENTRY_LOGIN,
+                redirect_url=request.GET.get('next') if request.GET.get('next') else request.path,
+            )
+            log.info('Redirecting User to Auth Provider: {}'.format(backend_name))
+            return HttpResponseRedirect(login_url)
+
+
+def _get_request_schema(request):
+    """
+    Return schema of request
+    """
+    environ = getattr(request, 'environ', {})
+    return environ.get('wsgi.url_scheme', 'http')
+
+
+def _get_current_url(request):
+    """
+    Return current request's complete url
+    """
+    schema = _get_request_schema(request)
+    domain = _get_request_site_domain(request)
+
+    return '{}://{}{}'.format(schema, domain, request.path)
+
+
+def _get_request_site_domain(request):
+    """
+    Return domain of site being requested by the User.
+    """
+    site = getattr(request, 'site', None)
+    domain = getattr(site, 'domain', None)
+    return domain
 
 
 def _get_form_descriptions(request):
